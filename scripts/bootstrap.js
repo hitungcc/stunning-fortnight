@@ -71,10 +71,24 @@ client.on("steamGuard", async (domain, callback, lastCodeWrong) => {
   callback(code.trim());
 });
 
+let finishTimeout;
+
 client.on("loggedOn", () => {
   console.log("");
   console.log(chalk.green("✔ Logged in successfully!"));
-  console.log(chalk.green("✔ Machine auth token saved to ./sentry/"));
+  console.log(chalk.gray("Waiting for session token to be saved..."));
+  
+  // Fallback in case refreshToken doesn't fire
+  finishTimeout = setTimeout(finishBootstrap, 5000);
+});
+
+client.on("refreshToken", () => {
+  if (finishTimeout) clearTimeout(finishTimeout);
+  finishBootstrap();
+});
+
+function finishBootstrap() {
+  console.log(chalk.green("✔ Session token saved to ./sentry/"));
   console.log("");
   console.log(chalk.cyan("You can now start PM2:"));
   console.log(chalk.bold("  pm2 start ecosystem.config.cjs --env production"));
@@ -82,7 +96,7 @@ client.on("loggedOn", () => {
   console.log(chalk.gray("Logging off and exiting..."));
 
   client.logOff();
-});
+}
 
 client.on("disconnected", () => {
   rl.close();
