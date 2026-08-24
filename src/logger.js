@@ -2,7 +2,7 @@ import chalk from "chalk";
 
 /**
  * Simple structured logger with timestamps and color coding.
- * Designed to work well with PM2 log management.
+ * Designed to stay readable in a tmux pane over SSH.
  */
 
 const timestamp = () => {

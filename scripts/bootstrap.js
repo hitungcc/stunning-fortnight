@@ -3,13 +3,13 @@
  * ║         STUNNING-FORTNIGHT • Bootstrap / First-Login         ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
- * Run this ONCE manually before starting PM2.
+ * Run this ONCE manually before starting the idler in tmux.
  * It will:
  *   1. Log in with your credentials (and prompt for Steam Guard code)
  *   2. Save the machine auth token to ./sentry/
  *   3. Exit cleanly
  *
- * After this, PM2 will reuse the saved session and won't need codes.
+ * After this, the idler reuses the saved session and won’t need codes.
  *
  * Usage:
  *   node scripts/bootstrap.js
@@ -41,7 +41,7 @@ console.log(chalk.cyan("║       STUNNING-FORTNIGHT — First Login Bootstrap  
 console.log(chalk.cyan("╚══════════════════════════════════════════════════════════╝"));
 console.log("");
 console.log(chalk.gray("This will log in once and save the session to ./sentry/"));
-console.log(chalk.gray("After this, PM2 won't need Steam Guard codes on restart.\n"));
+console.log(chalk.gray("After this, the idler will not need Steam Guard codes on restart.\n"));
 
 const client = new SteamUser({
   autoRelogin: false,
@@ -90,8 +90,8 @@ client.on("refreshToken", () => {
 function finishBootstrap() {
   console.log(chalk.green("✔ Session token saved to ./sentry/"));
   console.log("");
-  console.log(chalk.cyan("You can now start PM2:"));
-  console.log(chalk.bold("  pm2 start ecosystem.config.cjs --env production"));
+  console.log(chalk.cyan("You can now start the idler in tmux:"));
+  console.log(chalk.bold("  npm run tmux:start"));
   console.log("");
   console.log(chalk.gray("Logging off and exiting..."));
 

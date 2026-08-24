@@ -3,6 +3,7 @@ import SteamTotp from "steam-totp";
 import chalk from "chalk";
 import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
+import { IdleScheduler, ROLE, formatDuration } from "./scheduler.js";
 
 // ─────────────────────────────────────────────────────────────
 // Fetch game names from Steam Store API
@@ -65,6 +66,17 @@ const client = new SteamUser({
   dataDirectory: "./sentry",         // store sentry files for session persistence
 });
 
+// Decides which games are idling at any moment — see IDLE_MODE in .env
+const scheduler = new IdleScheduler({
+  mode: config.idle.mode,
+  gameIds: config.gameIds,
+  pinnedIds: config.idle.pinnedIds,
+  batchSize: config.idle.batchSize,
+  intervalMinutes: config.idle.intervalMinutes,
+  jitterPercent: config.idle.jitterPercent,
+  statePath: config.idle.stateFile,
+});
+
 log.info(`Machine name: ${chalk.bold(config.machineName)} (will appear in Steam login devices)`);
 
 // ─────────────────────────────────────────────────────────────
@@ -86,6 +98,37 @@ function formatUptime(ms) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Idling — either the rotating batch or the whole list
+// ─────────────────────────────────────────────────────────────
+function nameOf(id) {
+  return gameNames[id] || `Unknown (${id})`;
+}
+
+/** Called by the scheduler every time the active set changes. */
+function onScheduleChange(activeIds) {
+  client.gamesPlayed(activeIds);
+  const list = chalk.bold(formatGameList(activeIds, gameNames));
+  if (scheduler.rotates) {
+    log.steam(
+      `Now idling: ${list} ` +
+      chalk.gray(`(next switch in ~${config.idle.intervalMinutes}m)`)
+    );
+  } else {
+    log.steam(`Now idling: ${list}`);
+  }
+}
+
+/** (Re)start idling after login. */
+function startIdling() {
+  scheduler.start(onScheduleChange);
+}
+
+/** Bank playtime whenever idling actually stops. */
+function pauseIdling() {
+  scheduler.pause();
+}
+
+// ─────────────────────────────────────────────────────────────
 // Heartbeat — periodic status logging
 // ─────────────────────────────────────────────────────────────
 function startHeartbeat() {
@@ -95,13 +138,28 @@ function startHeartbeat() {
   heartbeatTimer = setInterval(() => {
     const uptime = loginStartTime ? formatUptime(Date.now() - loginStartTime) : "unknown";
     const memUsage = Math.round(process.memoryUsage().rss / 1024 / 1024);
-    const gameList = formatGameList(config.gameIds, gameNames);
+
+    // Bank progress on every heartbeat so a hard kill loses minutes, not hours
+    scheduler.credit();
+    scheduler.save();
+
     log.heartbeat(
-      `Idling ${config.gameIds.length} game(s) | ` +
-      `Uptime: ${uptime} | ` +
-      `Memory: ${memUsage}MB`
+      `Mode ${chalk.bold(scheduler.mode)}: ${scheduler.describe()} | ` +
+      `Uptime: ${uptime} | Memory: ${memUsage}MB`
     );
-    log.heartbeat(`Games: ${gameList}`);
+    log.heartbeat(`Active: ${formatGameList(scheduler.active, gameNames)}`);
+    for (const { id, ms, role } of scheduler.stats()) {
+      const tag =
+        role === ROLE.PINNED
+          ? chalk.green("pinned")
+          : role === ROLE.PARKED
+            ? chalk.gray("parked")
+            : chalk.cyan("rotating");
+      log.heartbeat(
+        `  ${chalk.gray("·")} ${nameOf(id)} — ${formatDuration(ms)} idled ` +
+        chalk.gray("[") + tag + chalk.gray("]")
+      );
+    }
   }, intervalMs);
 
   // Don't let heartbeat timer prevent process exit
@@ -137,56 +195,40 @@ function doLogin() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Event: Steam Guard code needed (email-based 2FA)
+// Event: Steam Guard code needed
 // ─────────────────────────────────────────────────────────────
 client.on("steamGuard", (domain, callback, lastCodeWrong) => {
   if (config.sharedSecret) {
     // Mobile authenticator — generate code automatically
     const code = SteamTotp.generateAuthCode(config.sharedSecret);
-    log.info(`Steam Guard (mobile): auto-generated code`);
+    log.info("Steam Guard (mobile): auto-generated code");
     callback(code);
     return;
   }
 
-  if (domain) {
-    // Email-based Steam Guard — cannot auto-generate
-    log.warn(
-      `Steam Guard code required! Check your email at *@${domain}`
-    );
-    log.warn(
-      "For unattended 24/7 operation, set up Mobile Authenticator " +
-      "and provide STEAM_SHARED_SECRET in .env"
-    );
-
-    // Read from stdin (works in terminal, not ideal for PM2)
-    process.stdout.write("Enter Steam Guard code: ");
-    let input = "";
-    process.stdin.setEncoding("utf-8");
-    process.stdin.resume();
-    process.stdin.once("data", (data) => {
-      input = data.toString().trim();
-      process.stdin.pause();
-      callback(input);
-    });
-  } else {
-    // Mobile authenticator but no shared secret
-    log.warn(
-      "Steam Guard mobile code required but no STEAM_SHARED_SECRET set."
-    );
-    log.warn(
-      "For unattended operation, provide STEAM_SHARED_SECRET in .env"
-    );
-
-    process.stdout.write("Enter Mobile Authenticator code: ");
-    let input = "";
-    process.stdin.setEncoding("utf-8");
-    process.stdin.resume();
-    process.stdin.once("data", (data) => {
-      input = data.toString().trim();
-      process.stdin.pause();
-      callback(input);
-    });
+  if (lastCodeWrong) {
+    log.error("Previous Steam Guard code was rejected — try again.");
   }
+
+  if (domain) {
+    log.warn(`Steam Guard code required! Check your email at *@${domain}`);
+  } else {
+    log.warn("Steam Guard mobile code required but no STEAM_SHARED_SECRET set.");
+  }
+  log.warn(
+    "Type the code below. For unattended operation set STEAM_SHARED_SECRET in .env, " +
+    "or run `npm run bootstrap` once so the session is cached in ./sentry/."
+  );
+
+  // Running inside tmux means stdin is a real terminal: attach the session
+  // and type the code straight into the pane.
+  process.stdout.write("Enter Steam Guard code: ");
+  process.stdin.setEncoding("utf-8");
+  process.stdin.resume();
+  process.stdin.once("data", (data) => {
+    process.stdin.pause();
+    callback(data.toString().trim());
+  });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -215,19 +257,15 @@ client.on("loggedOn", async (details) => {
   gameNames = await fetchGameNames(config.gameIds);
 
   // Log each game with its resolved name
-  log.steam(`Now idling ${config.gameIds.length} game(s):`);
+  log.steam(`Game pool (${config.gameIds.length}):`);
   for (const id of config.gameIds) {
-    const name = gameNames[id] || `Unknown`;
-    log.steam(`  → ${chalk.bold(name)} ${chalk.gray(`(App ID: ${id})`)}`);  
+    log.steam(`  → ${chalk.bold(nameOf(id))} ${chalk.gray(`(App ID: ${id})`)}`);
   }
 
-  // Start idling the configured games
-  client.gamesPlayed(config.gameIds);
-
-  // Start heartbeat
+  startIdling();
   startHeartbeat();
 
-  log.success("Service is running! Press Ctrl+C to stop (or let PM2 manage it).");
+  log.success("Service is running! Ctrl+B then D detaches tmux, Ctrl+C stops the idler.");
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -253,16 +291,18 @@ client.on("wallet", (hasWallet, currency, balance) => {
 // ─────────────────────────────────────────────────────────────
 client.on("playingState", (blocked, playingApp) => {
   if (blocked) {
-    const appName = gameNames[playingApp] || playingApp;
     log.warn(
-      `Idling blocked! Game being played elsewhere: ${appName} (App ID: ${playingApp}). ` +
-      `Idling will resume when you stop playing.`
+      `Idling blocked! Game being played elsewhere: ${nameOf(playingApp)} ` +
+      `(App ID: ${playingApp}). Idling will resume when you stop playing.`
     );
+    // Don't credit idle time we aren't actually getting
+    pauseIdling();
   } else {
-    // Re-start idling
-    client.gamesPlayed(config.gameIds);
-    const gameList = formatGameList(config.gameIds, gameNames);
-    log.steam(`Idling resumed: ${gameList}`);
+    // Resume the same set it was on — a rotating queue loses nothing
+    const active = scheduler.resume();
+    if (active.length === 0) return;   // login handler hasn't picked a set yet
+    client.gamesPlayed(active);
+    log.steam(`Idling resumed: ${formatGameList(active, gameNames)}`);
   }
 });
 
@@ -271,6 +311,7 @@ client.on("playingState", (blocked, playingApp) => {
 // ─────────────────────────────────────────────────────────────
 client.on("disconnected", (eresult, msg) => {
   stopHeartbeat();
+  pauseIdling();
   log.warn(`Disconnected from Steam (EResult: ${eresult}, Message: ${msg || "none"})`);
 
   if (isShuttingDown) return;
@@ -298,6 +339,7 @@ client.on("disconnected", (eresult, msg) => {
 // ─────────────────────────────────────────────────────────────
 client.on("error", (err) => {
   log.error(`Steam client error: ${err.message}`);
+  pauseIdling();
 
   // Some errors are fatal and shouldn't auto-reconnect
   const fatalErrors = [
@@ -341,6 +383,7 @@ function shutdown(signal) {
 
   log.info(`\nReceived ${signal}. Shutting down gracefully...`);
   stopHeartbeat();
+  scheduler.stop();   // banks and persists accumulated playtime
 
   client.gamesPlayed([]); // stop idling
   client.logOff();
@@ -354,7 +397,8 @@ function shutdown(signal) {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-// Handle uncaught exceptions (keep PM2 from restarting in loops)
+// Keep the process alive on unexpected errors — a tmux pane that dies
+// silently is worse than one that logs and keeps retrying.
 process.on("uncaughtException", (err) => {
   log.error("Uncaught exception:", err.message);
   log.error(err.stack);
@@ -371,18 +415,32 @@ log.info("═══════════════════════�
 log.info("  STUNNING-FORTNIGHT • Steam Idler Service");
 log.info("═══════════════════════════════════════════════════");
 log.info(`Games to idle: [${config.gameIds.join(", ")}]`);
+log.info(`Idle mode: ${chalk.bold(scheduler.mode)} — ${scheduler.describe()}`);
+if (scheduler.pinned.length > 0) {
+  log.info(`Pinned (always on): [${scheduler.pinned.join(", ")}]`);
+}
+if (scheduler.parked.length > 0) {
+  log.info(chalk.yellow(`Never played in this mode: [${scheduler.parked.join(", ")}]`));
+}
+if (scheduler.rotates) {
+  log.info(
+    `Rotation: every ${config.idle.intervalMinutes}m ` +
+    `(±${config.idle.jitterPercent}% jitter)`
+  );
+}
+log.info(`Idle state file: ${config.idle.stateFile}`);
 log.info(`Heartbeat interval: ${config.heartbeatInterval} minutes`);
 log.info(`Reconnect delay: ${config.reconnectDelay} seconds`);
 log.info(`2FA mode: ${config.sharedSecret ? "Auto (shared_secret)" : "Manual prompt"}`);
 log.info(`Device name: ${config.machineName}`);
 log.info("═══════════════════════════════════════════════════");
 
-// Pre-fetch game names before login for boot log
+// Pre-fetch game names before login for the boot log
 (async () => {
   log.info("Fetching game names...");
   gameNames = await fetchGameNames(config.gameIds);
   for (const id of config.gameIds) {
-    log.info(`  → ${chalk.bold(gameNames[id] || "Unknown")} ${chalk.gray(`(${id})`)}`);  
+    log.info(`  → ${chalk.bold(nameOf(id))} ${chalk.gray(`(${id})`)}`);
   }
   doLogin();
 })();

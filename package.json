@@ -1,18 +1,16 @@
 {
   "name": "stunning-fortnight",
-  "version": "1.0.0",
-  "description": "Steam game idler service — runs 24/7 via PM2, supports 2FA (Steam Guard Mobile Authenticator & email code)",
+  "version": "2.0.0",
+  "description": "Steam game idler — runs 24/7 in a tmux session, rotates games round-robin, supports 2FA (Steam Guard Mobile Authenticator & email code)",
   "main": "src/idler.js",
   "type": "module",
   "scripts": {
     "start": "node src/idler.js",
     "dev": "node --watch src/idler.js",
     "bootstrap": "node scripts/bootstrap.js",
-    "pm2:start": "pm2 start ecosystem.config.cjs --env production",
-    "pm2:stop": "pm2 stop steam-idler",
-    "pm2:restart": "pm2 restart steam-idler",
-    "pm2:logs": "pm2 logs steam-idler",
-    "pm2:status": "pm2 status"
+    "tmux:start": "sh scripts/tmux-start.sh",
+    "tmux:attach": "tmux attach -t steam-idler",
+    "tmux:stop": "tmux kill-session -t steam-idler"
   },
   "dependencies": {
     "chalk": "^5.4.1",
@@ -28,7 +26,7 @@
     "idler",
     "playtime",
     "trading-cards",
-    "pm2",
+    "tmux",
     "termux"
   ],
   "license": "MIT",

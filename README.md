@@ -1,43 +1,42 @@
-# 🎮 Stunning Fortnight — Steam Idler Service
+# Stunning Fortnight - Steam Idler Service
 
-A headless Node.js service for idling Steam games 24/7 to accumulate playtime and collect trading card drops. Designed to run on low-power devices like old phones (Termux) or SBCs (Armbian) via PM2.
+A headless Node.js service for idling Steam games 24/7 to accumulate playtime and collect trading card drops. Designed to run on low-power devices like old phones (Termux) or SBCs (Armbian) inside a **tmux** session you can attach to over SSH.
 
-## ✨ Features
+## Features
 
-- **24/7 unattended idling** — set it and forget it
-- **Full 2FA support** — auto-generates codes from `shared_secret` (no manual input needed)
-- **PM2 integration** — auto-restart, log management, memory limits
-- **Termux-friendly** — runs on old Android phones + Termux
-- **Multi-game idling** — idle up to 32 games simultaneously
-- **Game Name Resolution** — automatically resolves App IDs to game names via Steam Store API
-- **Device Customization** — custom machine/device name shown in Steam authorized devices list
-- **Auto-reconnect** — survives network drops and Steam maintenance
-- **Stealth mode** — idle while appearing offline
-- **Heartbeat logging** — periodic status updates confirming uptime and active games
+- **24/7 unattended idling** - set it and forget it
+- **Four idle modes** - all-at-once, continuous, pinned+rotating hybrid, or full round-robin
+- **Full 2FA support** - auto-generates codes from `shared_secret`, or type the code once into the tmux pane
+- **tmux-based** - a real terminal you can detach from and re-attach to over SSH, no daemon manager needed
+- **Termux-friendly** - runs on old Android phones + Termux
+- **Multi-game idling** - up to 32 games in the pool
+- **Game Name Resolution** - resolves App IDs to game names via the Steam Store API
+- **Device Customization** - custom machine/device name shown in Steam's authorized devices list
+- **Auto-reconnect** - survives network drops and Steam maintenance
+- **Stealth mode** - idle while appearing offline
+- **Heartbeat logging** - periodic status updates with per-game idle totals
 
-## 📋 Prerequisites
+## Prerequisites
 
 - **Node.js** ≥ 18.x
-- **npm** 
-- **PM2** (for 24/7 daemon operation)
+- **npm**
+- **tmux**
 
 ### For Termux (Android):
 
 ```bash
 pkg update && pkg upgrade
-pkg install nodejs-lts
-npm install -g pm2
+pkg install nodejs-lts tmux openssh
 ```
 
 ### For Armbian / Linux SBC:
 
 ```bash
 curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-sudo apt install -y nodejs
-npm install -g pm2
+sudo apt install -y nodejs tmux
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Clone & Install
 
@@ -64,43 +63,128 @@ STEAM_GAME_IDS=730,440,570
 
 ### 3. One-Time Setup (Session Bootstrap)
 
-If your Steam account has Steam Guard enabled and you are **NOT** using `STEAM_SHARED_SECRET`, you must authenticate interactively once to save your session token to the `sentry/` cache:
+If your Steam account has Steam Guard enabled and you are **NOT** using `STEAM_SHARED_SECRET`, authenticate interactively once so the session token is cached in `sentry/`:
 
 ```bash
 npm run bootstrap
 ```
 
-This script will prompt you for your Steam Guard code (via email or authenticator). Once logged in successfully, it saves your credentials securely in the local `sentry/` directory, allowing PM2 to run unattended without prompts.
+Enter your Steam Guard code when prompted. After this the idler logs in without asking again, as long as `sentry/` is preserved.
 
-### 4. Run (Development)
-
-To test the idler in the foreground:
+### 4. Run in the Foreground (Test)
 
 ```bash
 npm start
 ```
 
-### 5. Run with PM2 (Production — 24/7)
+### 5. Run in tmux (24/7)
 
 ```bash
-# Start via npm script:
-npm run pm2:start
-
-# Or directly:
-pm2 start ecosystem.config.cjs --env production
-
-# On Termux:
-pm2 start ecosystem.config.cjs --env termux
-
-# Save PM2 state so it survives device reboot:
-pm2 save
-pm2 startup  # follow the instructions printed on the screen
+npm run tmux:start     # starts a detached session named "steam-idler"
+npm run tmux:attach    # attach to watch logs / type a 2FA code
+# Ctrl+B then D        # detach, leaving it running
+npm run tmux:stop      # stop the idler
 ```
 
-## 🔐 Steam Guard / 2FA Setup
+Because it's a real terminal, if Steam ever asks for a Guard code you just attach to the session and type it in - no restart loop, no lost prompt.
+
+## Idle Modes
+
+Idling every game simultaneously gives them **all exactly the same playtime**, which is an obvious tell. The four modes differ only in how `STEAM_GAME_IDS` is split between games that are **always on** and games that **take turns**:
+
+| `IDLE_MODE` | Always on | Takes turns | Never played | Use it when |
+|---|---|---|---|---|
+| `all` | everything | - | - | You want the old behaviour: one big batch, no rotation |
+| `continuous` | `IDLE_PINNED` | - | everything else | You're farming one or two specific games |
+| `hybrid` | `IDLE_PINNED` | everything else | - | One priority title always accruing, the rest sharing |
+| `rotate` *(default)* | - | everything | - | Full round-robin: spread time evenly across the library |
+
+```env
+IDLE_MODE=rotate
+IDLE_BATCH_SIZE=1              # games idling at once, TOTAL (pinned included)
+IDLE_PINNED=                   # always-on App IDs (continuous / hybrid)
+IDLE_INTERVAL=30               # minutes per rotation slot
+IDLE_JITTER=15                 # ±15% random variation in slot length
+IDLE_STATE_FILE=./data/idle-state.json
+```
+
+### What each mode does
+
+**`all`** - every game in the list idles at once, forever. Steam's ~32-game cap applies.
+
+```
+730 + 440 + 570 + 220 + 620   ← for as long as the idler runs
+```
+
+**`continuous`** - `IDLE_PINNED` idles forever; the rest of the list is parked and never played. If `IDLE_PINNED` is empty, the first `IDLE_BATCH_SIZE` games are pinned and the idler logs which ones it picked.
+
+```env
+IDLE_MODE=continuous
+IDLE_PINNED=730
+```
+```
+730                            ← never switches
+440, 570, 220, 620: parked, 0h
+```
+
+**`hybrid`** - `IDLE_PINNED` idles forever, and the remaining games rotate through whatever slots are left (`IDLE_BATCH_SIZE` minus the pinned count).
+
+```env
+IDLE_MODE=hybrid
+IDLE_PINNED=730
+IDLE_BATCH_SIZE=2              # 1 pinned + 1 rotating
+```
+```
+00:00  730 + 570
+00:30  730 + 220
+01:00  730 + 620
+01:30  730 + 440              ← 730 always on, others share slot #2
+```
+
+**`rotate`** - nothing pinned; every game takes turns. Each slot the **least-idled** games are promoted, so totals converge without ever matching.
+
+```env
+IDLE_MODE=rotate
+IDLE_BATCH_SIZE=1
+```
+```
+00:00  440
+00:30  570
+01:00  220
+01:30  620
+02:00  730
+```
+
+### How the rotating modes pick
+
+1. Each slot, elapsed time is credited to whichever games were active.
+2. The queue then picks the games with the *lowest* accumulated total to fill the free slots.
+3. Totals are written to `IDLE_STATE_FILE`, so a restart resumes the queue instead of resetting it.
+4. Slot lengths are jittered, so totals drift apart naturally and never land on identical numbers.
+
+Time is only credited while idling actually happens - a disconnect or "playing elsewhere" block pauses the clock, and the interrupted game resumes its slot rather than losing its turn.
+
+Every heartbeat prints the running totals, tagged by role:
+
+```
+💓 Mode hybrid: 1 pinned + 1 of 4 rotating (2 idling at once) | Uptime: 6h 12m 4s | Memory: 71MB
+💓 Active: Counter-Strike 2 (730), Team Fortress 2 (440)
+💓   · Counter-Strike 2 - 6h 11m idled [pinned]
+💓   · Team Fortress 2 - 1h 34m idled [rotating]
+💓   · Dota 2 - 1h 33m idled [rotating]
+💓   · Half-Life 2 - 1h 31m idled [rotating]
+```
+
+> **Notes**
+> - Keep `IDLE_INTERVAL` at 30 or above - Steam credits playtime in roughly 30-minute chunks, so shorter slots risk games not being credited at all.
+> - If a mode's settings leave nothing to rotate, the idler says so and falls back to one that works (e.g. `hybrid` with no free slot becomes `continuous`; `rotate` with `IDLE_BATCH_SIZE` ≥ your game count becomes `all`).
+> - An unknown `IDLE_MODE` is a hard error listing the valid modes, rather than a silent default.
+> - Explicit `IDLE_PINNED` entries win over `IDLE_BATCH_SIZE` - pinning 3 games with `IDLE_BATCH_SIZE=2` idles all 3.
+
+## Steam Guard / 2FA Setup
 
 ### The Problem
-If your Steam account has 2FA enabled (which it should!), the idler needs a way to generate authentication codes automatically. Without this, it will prompt you for a code every time it connects — not ideal for 24/7 operation.
+If your Steam account has 2FA enabled (which it should!), the idler needs a way to generate authentication codes automatically. Without this, it will prompt you for a code every time it connects.
 
 ### The Solution: `shared_secret`
 
@@ -112,7 +196,7 @@ The `shared_secret` is the key used by the Steam Mobile Authenticator to generat
 1. Download [Steam Desktop Authenticator](https://github.com/Jessecar96/SteamDesktopAuthenticator)
 2. Import/set up your authenticator
 3. Open `maFiles/<your_steam_id>.maFile`
-4. Find the `"shared_secret"` field — copy the value
+4. Find the `"shared_secret"` field - copy the value
 
 **Option B: From a rooted Android device**
 1. Navigate to: `/data/data/com.valvesoftware.android.steam.community/files/`
@@ -121,7 +205,7 @@ The `shared_secret` is the key used by the Steam Mobile Authenticator to generat
 
 **Option C: Use a third-party tool**
 - Various tools exist to export the shared secret from your phone
-- **Be careful** — only use trusted, open-source tools
+- **Be careful** - only use trusted, open-source tools
 
 Once you have it, add to your `.env`:
 
@@ -129,55 +213,75 @@ Once you have it, add to your `.env`:
 STEAM_SHARED_SECRET=YourBase64SharedSecretHere
 ```
 
-### Without `shared_secret` (Manual 2FA Setup)
+### Without `shared_secret` (Manual 2FA)
 
-If you do not have or want to extract your `shared_secret`:
-1. Use the **Interactive Bootstrap Script**:
+1. Run the interactive bootstrap once:
    ```bash
    npm run bootstrap
    ```
 2. Enter your Steam Guard code manually when prompted.
 3. This saves your session token to the `sentry/` directory.
-4. As long as the `sentry/` folder is preserved and not deleted, the main idler can login via PM2 automatically without asking for codes.
+4. As long as `sentry/` is preserved, the idler logs in without asking again.
 
-> ⚠️ For truly unattended 24/7 operation, setting up Mobile Authenticator with `STEAM_SHARED_SECRET` is recommended.
+If Steam does ask for a code later, attach to the tmux session (`npm run tmux:attach`) and type it into the pane.
 
-## 📁 Project Structure
+> For truly unattended 24/7 operation, `STEAM_SHARED_SECRET` is still the most reliable option.
+
+## Project Structure
 
 ```
 stunning-fortnight/
 ├── src/
-│   ├── idler.js          # Main service — login, idle, reconnect
+│   ├── idler.js          # Main service - login, idle, reconnect
+│   ├── scheduler.js      # Idle modes, rotation queue & playtime accounting
 │   ├── config.js         # Config loader & validation
 │   └── logger.js         # Colored timestamped logger
 ├── scripts/
-│   └── bootstrap.js      # One-time interactive login script
+│   ├── bootstrap.js      # One-time interactive login script
+│   └── tmux-start.sh     # Launch the idler in a detached tmux session
 ├── sentry/               # Steam session cache (auto-generated, git-ignored)
-├── logs/                 # PM2 log files (auto-generated, git-ignored)
+├── data/                 # Idle state / playtime totals (auto-generated, git-ignored)
 ├── .env.example          # Config template
 ├── .env                  # Your local config (git-ignored)
-├── ecosystem.config.cjs  # PM2 configuration
 ├── package.json          # Project metadata & npm scripts
 └── README.md             # Documentation
 ```
 
-## 🔧 PM2 Commands
+## tmux Cheat Sheet
 
 ```bash
-pm2 start ecosystem.config.cjs    # Start the service
-pm2 stop steam-idler               # Stop
-pm2 restart steam-idler             # Restart
-pm2 logs steam-idler                # View live logs
-pm2 monit                           # Monitor dashboard
-pm2 status                          # Check status
-pm2 delete steam-idler              # Remove from PM2
+npm run tmux:start                 # start detached session "steam-idler"
+npm run tmux:attach                # attach to it
+npm run tmux:stop                  # kill it
 
-# Auto-start on boot
-pm2 save
-pm2 startup
+tmux ls                            # list sessions
+tmux attach -t steam-idler         # attach (same as npm run tmux:attach)
+tmux kill-session -t steam-idler   # stop (same as npm run tmux:stop)
 ```
 
-## ⚙️ Configuration Reference
+Inside a session (prefix is `Ctrl+B`):
+
+| Keys | Action |
+|------|--------|
+| `Ctrl+B` `D` | Detach - the idler keeps running |
+| `Ctrl+B` `[` | Scroll back through logs (`q` to exit) |
+| `Ctrl+B` `C` | New window |
+| `Ctrl+C` | Stop the idler (graceful shutdown, saves idle state) |
+
+Use `TMUX_SESSION=other-name npm run tmux:start` if you want to run more than one account.
+
+### Over SSH
+
+Attaching from another machine means you never have to touch the phone:
+
+```bash
+ssh -p 8022 u0_aXXX@<device-ip>   # Termux default SSH port is 8022
+tmux attach -t steam-idler
+```
+
+Detaching with `Ctrl+B` `D` (or just dropping the SSH connection) leaves the idler running.
+
+## Configuration Reference
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -188,45 +292,51 @@ pm2 startup
 | `STEAM_GAME_IDS` | *(required)* | Comma-separated App IDs to idle |
 | `STEAM_MACHINE_NAME` | `stunning-fortnight` | Custom device name visible in Steam authorized login history |
 | `STEAM_PERSONA_STATE` | `0` | Online status: 0=Offline, 1=Online, 2=Busy, 3=Away |
+| `IDLE_MODE` | `rotate` | `all`, `continuous`, `hybrid`, or `rotate` - see [Idle Modes](#-idle-modes) |
+| `IDLE_BATCH_SIZE` | `1` | How many games idle at once, total (pinned included) |
+| `IDLE_PINNED` | *(empty)* | Always-on App IDs for `continuous` / `hybrid` |
+| `IDLE_INTERVAL` | `30` | Minutes per rotation slot |
+| `IDLE_JITTER` | `15` | ±% random variation in slot length (0 = exact) |
+| `IDLE_STATE_FILE` | `./data/idle-state.json` | Where per-game idle totals are persisted |
 | `HEARTBEAT_INTERVAL` | `30` | Status log interval in minutes |
 | `RECONNECT_DELAY` | `30` | Seconds to wait before reconnecting |
 | `MAX_RECONNECT_ATTEMPTS` | `0` | Max retries (0 = infinite) |
+| `DEBUG` | `false` | Set to `true` for verbose debug logging |
 
-## 📱 Termux Tips
+## Termux Tips
 
-1. **Keep Termux awake**: Acquire a wakelock to prevent Android from killing Termux:
+1. **Keep Termux awake**: acquire a wakelock so Android doesn't kill it (`tmux-start.sh` does this automatically if available):
    ```bash
    termux-wake-lock
    ```
 
-2. **Disable battery optimization**: Go to Android Settings → Apps → Termux → Battery → Unrestricted
+2. **Disable battery optimization**: Android Settings → Apps → Termux → Battery → Unrestricted
 
-3. **PM2 startup on boot**: Use Termux:Boot add-on:
+3. **Start on boot**: use the Termux:Boot add-on (F-Droid):
    ```bash
-   # Install Termux:Boot from F-Droid
    mkdir -p ~/.termux/boot
-   echo '#!/data/data/com.termux/files/usr/bin/bash
+   cat > ~/.termux/boot/start-idler.sh <<'EOF'
+   #!/data/data/com.termux/files/usr/bin/bash
    termux-wake-lock
-   pm2 resurrect' > ~/.termux/boot/start-pm2.sh
-   chmod +x ~/.termux/boot/start-pm2.sh
+   cd ~/stunning-fortnight && sh scripts/tmux-start.sh
+   EOF
+   chmod +x ~/.termux/boot/start-idler.sh
    ```
+   The script reuses an existing session, so a reboot won't start a second idler.
 
-4. **Monitor memory**: Old phones may have limited RAM:
-   ```bash
-   pm2 monit
-   ```
+4. **SSH in instead of opening Termux**: run `sshd` in Termux and connect on port 8022, then `tmux attach -t steam-idler`.
 
-## ⚖️ Disclaimer
+## Disclaimer
 
 - Steam idling is generally safe and Valve has not banned accounts for using idlers
-- This tool only simulates "playing" — it does not interact with games or game servers
-- No VAC ban risk — the tool doesn't touch any game processes
+- This tool only simulates "playing" - it does not interact with games or game servers
+- No VAC ban risk - the tool doesn't touch any game processes
 - Use at your own discretion. The authors are not responsible for any actions taken by Valve
 
-## 📄 License
+## License
 
-MIT — feel free to fork, modify, and use however you like.
+MIT - feel free to fork, modify, and use however you like.
 
-## 🙏 Credits
+## Credits
 
 Inspired by [dragonGR/steam-idler](https://github.com/dragonGR/steam-idler). Built with [steam-user](https://github.com/DoctorMcKay/node-steam-user) and [steam-totp](https://github.com/DoctorMcKay/node-steam-totp) by DoctorMcKay.
