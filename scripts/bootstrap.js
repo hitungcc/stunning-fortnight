@@ -21,6 +21,9 @@ import chalk from "chalk";
 import readline from "readline";
 import dotenv from "dotenv";
 import { loadConfig } from "../src/config.js";
+import { saveRefreshToken } from "../src/session.js";
+
+const SENTRY_DIR = "./sentry";
 
 dotenv.config();
 
@@ -45,8 +48,11 @@ console.log(chalk.gray("After this, the idler will not need Steam Guard codes on
 
 const client = new SteamUser({
   autoRelogin: false,
-  dataDirectory: "./sentry",
+  renewRefreshTokens: true,
+  dataDirectory: SENTRY_DIR,
 });
+
+let tokenSaved = false;
 
 client.on("steamGuard", async (domain, callback, lastCodeWrong) => {
   if (config.sharedSecret) {
@@ -82,13 +88,26 @@ client.on("loggedOn", () => {
   finishTimeout = setTimeout(finishBootstrap, 5000);
 });
 
-client.on("refreshToken", () => {
+client.on("refreshToken", (token) => {
+  const err = saveRefreshToken(SENTRY_DIR, token);
+  tokenSaved = !err;
+  if (err) {
+    console.log(chalk.red(`\n✖ Could not save session token: ${err.message}`));
+  }
   if (finishTimeout) clearTimeout(finishTimeout);
   finishBootstrap();
 });
 
 function finishBootstrap() {
-  console.log(chalk.green("✔ Session token saved to ./sentry/"));
+  if (tokenSaved) {
+    console.log(chalk.green(`✔ Session token saved to ${SENTRY_DIR}/refresh-token.json`));
+  } else {
+    console.log(
+      chalk.yellow(
+        "⚠ No session token was saved — the idler will prompt for 2FA again on its first run."
+      )
+    );
+  }
   console.log("");
   console.log(chalk.cyan("You can now start the idler in tmux:"));
   console.log(chalk.bold("  npm run tmux:start"));

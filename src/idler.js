@@ -4,6 +4,7 @@ import chalk from "chalk";
 import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
 import { IdleScheduler, ROLE, formatDuration } from "./scheduler.js";
+import { loadRefreshToken, saveRefreshToken, clearRefreshToken } from "./session.js";
 
 // ─────────────────────────────────────────────────────────────
 // Fetch game names from Steam Store API
@@ -60,11 +61,18 @@ let isShuttingDown = false;
 let loginStartTime = null;
 let gameNames = {};  // { appId: "Game Name" }
 
+const SENTRY_DIR = "./sentry";
+
 const client = new SteamUser({
   autoRelogin: true,
   renewRefreshTokens: true,
-  dataDirectory: "./sentry",         // store sentry files for session persistence
+  dataDirectory: SENTRY_DIR,         // store sentry files for session persistence
 });
+
+// Whether the login currently in flight used the saved refresh token, so the
+// error handler knows whether a rejection means "token is dead, fall back to
+// password" or "password/2FA are actually wrong".
+let loginViaRefreshToken = false;
 
 // Decides which games are idling at any moment — see IDLE_MODE in .env
 const scheduler = new IdleScheduler({
@@ -177,7 +185,25 @@ function stopHeartbeat() {
 // Login
 // ─────────────────────────────────────────────────────────────
 function doLogin() {
+  const savedToken = loadRefreshToken(SENTRY_DIR);
+
+  if (savedToken) {
+    log.info("Logging in with saved session (no 2FA needed)...");
+    loginViaRefreshToken = true;
+    try {
+      client.logOn({ refreshToken: savedToken });
+    } catch (err) {
+      // Malformed/corrupt token file — don't loop on it, fall back to password.
+      log.warn(`Saved session token is invalid (${err.message}); logging in with password.`);
+      clearRefreshToken(SENTRY_DIR);
+      loginViaRefreshToken = false;
+      doLogin();
+    }
+    return;
+  }
+
   log.info("Attempting to log in as", chalk.bold(config.username), "...");
+  loginViaRefreshToken = false;
 
   const loginOptions = {
     accountName: config.username,
@@ -349,6 +375,26 @@ client.on("error", (err) => {
     SteamUser.EResult.InvalidLoginAuthCode,
   ];
 
+  // A saved session token can go stale (revoked, expired, Steam Guard reset).
+  // That's not a real credential failure — clear it and fall back to a normal
+  // password + 2FA login instead of treating it as fatal.
+  const tokenRejected = [
+    SteamUser.EResult.AccessDenied,
+    SteamUser.EResult.Expired,
+    SteamUser.EResult.InvalidSignature,
+    ...fatalErrors,
+  ];
+
+  if (loginViaRefreshToken && tokenRejected.includes(err.eresult)) {
+    log.warn("Saved session was rejected by Steam; clearing it and logging in with password.");
+    clearRefreshToken(SENTRY_DIR);
+    loginViaRefreshToken = false;
+    setTimeout(() => {
+      if (!isShuttingDown) doLogin();
+    }, 1000);
+    return;
+  }
+
   if (fatalErrors.includes(err.eresult)) {
     log.error("Fatal authentication error. Check your credentials and 2FA settings.");
     log.error("Exiting. Fix the issue and restart the service.");
@@ -371,7 +417,12 @@ client.on("error", (err) => {
 // Event: New login key (session refresh — good for persistence)
 // ─────────────────────────────────────────────────────────────
 client.on("refreshToken", (token) => {
-  log.debug("Received new refresh token (session persisted)");
+  const err = saveRefreshToken(SENTRY_DIR, token);
+  if (err) {
+    log.warn(`Could not persist session token (${err.message}); will need 2FA on next restart.`);
+  } else {
+    log.debug("Refresh token saved — next restart won't need a 2FA prompt.");
+  }
 });
 
 // ─────────────────────────────────────────────────────────────
