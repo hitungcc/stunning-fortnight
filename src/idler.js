@@ -4,6 +4,7 @@ import chalk from "chalk";
 import { loadConfig } from "./config.js";
 import { log } from "./logger.js";
 import { IdleScheduler, ROLE, formatDuration } from "./scheduler.js";
+import { AchievementRunner, parseQuietHours } from "./achiever.js";
 import { loadRefreshToken, saveRefreshToken, clearRefreshToken } from "./session.js";
 
 // ─────────────────────────────────────────────────────────────
@@ -85,6 +86,16 @@ const scheduler = new IdleScheduler({
   statePath: config.idle.stateFile,
 });
 
+// Unlocks achievements on an idle-time schedule — see ACH_* in .env
+const achiever = config.achievements.enabled
+  ? new AchievementRunner({
+      client,
+      scheduler,
+      settings: config.achievements,
+      nameOf: (id) => nameOf(id),
+    })
+  : null;
+
 log.info(`Machine name: ${chalk.bold(config.machineName)} (will appear in Steam login devices)`);
 
 // ─────────────────────────────────────────────────────────────
@@ -115,6 +126,7 @@ function nameOf(id) {
 /** Called by the scheduler every time the active set changes. */
 function onScheduleChange(activeIds) {
   client.gamesPlayed(activeIds);
+  achiever?.onActive(activeIds);
   const list = chalk.bold(formatGameList(activeIds, gameNames));
   if (scheduler.rotates) {
     log.steam(
@@ -134,6 +146,7 @@ function startIdling() {
 /** Bank playtime whenever idling actually stops. */
 function pauseIdling() {
   scheduler.pause();
+  achiever?.pause();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -163,9 +176,11 @@ function startHeartbeat() {
           : role === ROLE.PARKED
             ? chalk.gray("parked")
             : chalk.cyan("rotating");
+      const ach = achiever?.status(id);
       log.heartbeat(
         `  ${chalk.gray("·")} ${nameOf(id)} — ${formatDuration(ms)} idled ` +
-        chalk.gray("[") + tag + chalk.gray("]")
+        chalk.gray("[") + tag + chalk.gray("]") +
+        (ach ? chalk.gray(` · ${ach}`) : "")
       );
     }
   }, intervalMs);
@@ -291,6 +306,15 @@ client.on("loggedOn", async (details) => {
   startIdling();
   startHeartbeat();
 
+  if (achiever) {
+    // Games this mode will actually idle; parked ones would never progress
+    const schedulable = config.gameIds.filter((id) => !scheduler.parked.includes(id));
+    achiever
+      .prepare(schedulable)
+      .then(() => achiever.start())
+      .catch((err) => log.error(`Achievement planning failed: ${err.message}`));
+  }
+
   log.success("Service is running! Ctrl+B then D detaches tmux, Ctrl+C stops the idler.");
 });
 
@@ -328,6 +352,7 @@ client.on("playingState", (blocked, playingApp) => {
     const active = scheduler.resume();
     if (active.length === 0) return;   // login handler hasn't picked a set yet
     client.gamesPlayed(active);
+    achiever?.onActive(active);
     log.steam(`Idling resumed: ${formatGameList(active, gameNames)}`);
   }
 });
@@ -337,6 +362,7 @@ client.on("playingState", (blocked, playingApp) => {
 // ─────────────────────────────────────────────────────────────
 client.on("disconnected", (eresult, msg) => {
   stopHeartbeat();
+  achiever?.stop();
   pauseIdling();
   log.warn(`Disconnected from Steam (EResult: ${eresult}, Message: ${msg || "none"})`);
 
@@ -435,6 +461,8 @@ function shutdown(signal) {
   log.info(`\nReceived ${signal}. Shutting down gracefully...`);
   stopHeartbeat();
   scheduler.stop();   // banks and persists accumulated playtime
+  achiever?.stop();
+  achiever?.save();
 
   client.gamesPlayed([]); // stop idling
   client.logOff();
@@ -480,6 +508,18 @@ if (scheduler.rotates) {
   );
 }
 log.info(`Idle state file: ${config.idle.stateFile}`);
+if (achiever) {
+  const a = config.achievements;
+  const quiet = parseQuietHours(a.quietHours);
+  const completion = Array.isArray(a.completion) ? a.completion.join("–") : a.completion;
+  log.info(
+    `Achievements: ${a.dryRun ? chalk.yellow("DRY-RUN (nothing is unlocked)") : chalk.green("LIVE")} | ` +
+    `${a.hoursEach}h each, ${a.minHours}–${a.maxHours}h per game | completion ${completion}% | ` +
+    `quiet hours ${quiet ? `${quiet.start}:00–${quiet.end}:00` : "off"}`
+  );
+} else {
+  log.info("Achievements: off (set ACH_ENABLED=true to enable)");
+}
 log.info(`Heartbeat interval: ${config.heartbeatInterval} minutes`);
 log.info(`Reconnect delay: ${config.reconnectDelay} seconds`);
 log.info(`2FA mode: ${config.sharedSecret ? "Auto (shared_secret)" : "Manual prompt"}`);

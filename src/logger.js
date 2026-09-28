@@ -21,5 +21,6 @@ export const log = {
     }
   },
   steam: (...args) => console.log(timestamp(), chalk.blue("🎮"), ...args),
+  achievement: (...args) => console.log(timestamp(), chalk.yellow("🏆"), ...args),
   heartbeat: (...args) => console.log(timestamp(), chalk.hex("#4a9eff")("💓"), ...args),
 };

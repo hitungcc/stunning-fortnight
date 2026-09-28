@@ -143,6 +143,12 @@ export class IdleScheduler {
     }
   }
 
+  /** Idle ms for one game including the running slot, without banking it. */
+  playedNow(id) {
+    const live = this.since !== null && this.active.includes(id) ? Date.now() - this.since : 0;
+    return (this.played[id] || 0) + Math.max(0, live);
+  }
+
   /** Least-idled pool games first; ties broken by cycle offset so they take turns. */
   #pick() {
     if (this.pool.length === 0 || this.slots === 0) return [];

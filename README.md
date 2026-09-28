@@ -15,6 +15,7 @@ A headless Node.js service for idling Steam games 24/7 to accumulate playtime an
 - **Auto-reconnect** - survives network drops and Steam maintenance
 - **Stealth mode** - idle while appearing offline
 - **Heartbeat logging** - periodic status updates with per-game idle totals
+- **Gradual achievement unlocking** - paced by each game's idle time, rarity-ordered, with quiet hours and a dry-run mode
 
 ## Prerequisites
 
@@ -181,6 +182,72 @@ Every heartbeat prints the running totals, tagged by role:
 > - An unknown `IDLE_MODE` is a hard error listing the valid modes, rather than a silent default.
 > - Explicit `IDLE_PINNED` entries win over `IDLE_BATCH_SIZE` - pinning 3 games with `IDLE_BATCH_SIZE=2` idles all 3.
 
+## Achievements
+
+The idler can unlock each game's achievements gradually while it idles. Progress is paced by how long **that game** has idled, not by wall-clock time, so only games idling right now make progress, and rotation or disconnects stretch the schedule without changing it.
+
+```env
+ACH_ENABLED=true
+ACH_DRY_RUN=true    # logs what it would unlock; set to false to go live
+```
+
+On login, each game gets a plan built from Steam's current state:
+
+- **Budget** - `ACH_HOURS_EACH` idle hours per remaining achievement, kept between `ACH_MIN_HOURS` and `ACH_MAX_HOURS`, then varied by `ACH_JITTER` percent per game.
+- **Order** - common achievements first and rare ones last (by global unlock percentage), with slight shuffling.
+- **Spacing** - irregular gaps, longer before rare achievements, with occasional quick follow-ups (`ACH_BURST`).
+- **Completion** - `ACH_COMPLETION=100` by default; a range like `80-95` picks a target per game and leaves the rarest locked.
+- **Stat-linked achievements** - unlocked together with their stat raised to the required value, so both stay consistent (`ACH_STAT_LINKED=false` skips them). Protected achievements are always skipped.
+
+At unlock time the idler also:
+
+- waits until the game has been idling for `ACH_WARMUP` minutes in the current session,
+- holds unlocks during `ACH_QUIET_HOURS` (default `02-08` local time),
+- re-reads the game's stats first and skips anything already unlocked, e.g. if you played the game yourself.
+
+Plans are stored in `ACH_STATE_FILE`, so restarts continue where they left off. Changing any `ACH_*` pacing setting or switching dry-run off rebuilds the plans from Steam's current state. The heartbeat shows progress per game:
+
+```
+💓   · Idle Startup — 14h 2m idled [pinned] · 9/65 achievements, next in ~1h 48m of idle
+```
+
+> This writes to your Steam account. Achievement unlocking is not VAC-related, but it is visible on your profile, and some community sites and developers flag obviously automated unlocks. Try it on a secondary account first, and keep dry-run on until the plans look right.
+
+### Achievement Tools
+
+Standalone commands to inspect a game's achievements, preview an unlock timeline, and unlock a single achievement. The probe and the preview never change anything on your account.
+
+#### Probe a game
+
+```bash
+npm run ach:probe -- 440 620
+```
+
+Logs in, reads each game's achievement list, your unlock state and the global unlock percentages, prints them as a table, and saves them to `data/achievements/<appId>.json`. Flags mark achievements that can't be planned: `P` protected (server-side only), `S` tied to an in-game stat, `H` hidden.
+
+#### Preview a plan
+
+```bash
+npm run ach:plan -- 440 --hours-each 3 --min-hours 10 --max-hours 150
+```
+
+Works offline from the probe's saved file. It shows when each locked achievement would unlock, measured in **idle time for that game**, so rotation and pauses stretch the real-world schedule without changing the plan.
+
+- **Budget** - `--hours-each` per achievement, clamped between `--min-hours` and `--max-hours`, then varied by `--jitter` percent per game.
+- **Order** - `--order rarity` (default) puts common achievements first and rare ones last, with slight shuffling; `--order random` ignores rarity.
+- **Spacing** - gaps are irregular, rarer achievements take longer, and `--burst` sets the chance of a quick follow-up unlock a few minutes later.
+- **Completion** - `--completion 100` (default) plans everything eligible; `--completion 80-95` rolls a target per game and leaves the rarest ones locked.
+- **Exclusions** - protected achievements are always skipped, `--no-progress` skips stat-linked ones, and `--exclude ACH_A,ACH_B` leaves specific ones locked.
+- **Repeatable** - every preview prints its seed; pass `--seed <n>` to reproduce it.
+
+#### Unlock a single achievement
+
+```bash
+npm run ach:unlock -- 440 ACH_NAME
+```
+
+Unlocks one achievement **on the logged-in account**. It starts a play session for the game, shows exactly what will be written and asks for confirmation, then reads the stats back to verify. For a stat-linked achievement, the linked stat is raised to the value that unlocks it (never lowered), so the stat and the achievement stay consistent; pass `--no-stat` to set only the achievement.
+
 ## Steam Guard / 2FA Setup
 
 ### The Problem
@@ -235,10 +302,17 @@ stunning-fortnight/
 │   ├── idler.js          # Main service - login, idle, reconnect
 │   ├── scheduler.js      # Idle modes, rotation queue & playtime accounting
 │   ├── config.js         # Config loader & validation
-│   └── logger.js         # Colored timestamped logger
+│   ├── logger.js         # Colored timestamped logger
+│   ├── steam-stats.js    # Achievement schema, unlock state & stat writes
+│   ├── achievement-planner.js  # Unlock timeline from idle-time budget
+│   └── achiever.js       # Runs the plans while idling
 ├── scripts/
 │   ├── bootstrap.js      # One-time interactive login script
+│   ├── ach-probe.js      # Read a game's achievements (read-only)
+│   ├── ach-plan.js       # Preview an unlock timeline (offline)
+│   ├── ach-unlock-once.js  # Unlock one achievement and verify it
 │   └── tmux-start.sh     # Launch the idler in a detached tmux session
+├── test/                 # Unit tests (npm test)
 ├── sentry/               # Steam session cache (auto-generated, git-ignored)
 ├── data/                 # Idle state / playtime totals (auto-generated, git-ignored)
 ├── .env.example          # Config template
@@ -298,6 +372,20 @@ Detaching with `Ctrl+B` `D` (or just dropping the SSH connection) leaves the idl
 | `IDLE_INTERVAL` | `30` | Minutes per rotation slot |
 | `IDLE_JITTER` | `15` | ±% random variation in slot length (0 = exact) |
 | `IDLE_STATE_FILE` | `./data/idle-state.json` | Where per-game idle totals are persisted |
+| `ACH_ENABLED` | `false` | Unlock achievements while idling |
+| `ACH_DRY_RUN` | `true` | Log planned unlocks without writing anything |
+| `ACH_HOURS_EACH` | `3` | Average idle hours per achievement |
+| `ACH_MIN_HOURS` / `ACH_MAX_HOURS` | `10` / `150` | Bounds for a game's total idle budget |
+| `ACH_JITTER` | `20` | ±% random variation of each game's budget |
+| `ACH_ORDER` | `rarity` | `rarity` (common first) or `random` |
+| `ACH_COMPLETION` | `100` | Target %, or a range like `80-95` rolled per game |
+| `ACH_BURST` | `0.1` | Chance (0–1) of a quick follow-up unlock |
+| `ACH_STAT_LINKED` | `true` | Unlock stat-linked achievements, raising their stat |
+| `ACH_QUIET_HOURS` | `02-08` | Local hours with no unlocks (`off` to disable) |
+| `ACH_WARMUP` | `15` | Minutes into a session before a game can unlock |
+| `ACH_EXCLUDE` | *(empty)* | Achievement API names never to unlock |
+| `ACH_SKIP_GAMES` | *(empty)* | App IDs to leave out of achievement unlocking |
+| `ACH_STATE_FILE` | `./data/achievement-state.json` | Where unlock plans and progress are persisted |
 | `HEARTBEAT_INTERVAL` | `30` | Status log interval in minutes |
 | `RECONNECT_DELAY` | `30` | Seconds to wait before reconnecting |
 | `MAX_RECONNECT_ATTEMPTS` | `0` | Max retries (0 = infinite) |

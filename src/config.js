@@ -135,6 +135,8 @@ export function loadConfig() {
     console.warn('⚠️  Mode "all" idles every game at once, but Steam caps this at ~32.');
   }
 
+  const achievements = loadAchievementConfig();
+
   return {
     username,
     password,
@@ -147,5 +149,68 @@ export function loadConfig() {
     maxReconnectAttempts,
     machineName,
     idle,
+    achievements,
+  };
+}
+
+// ── Achievement unlocking ───────────────────────────────────
+function flag(name, fallback) {
+  const raw = (process.env[name] ?? "").trim().toLowerCase();
+  if (raw === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(raw);
+}
+
+function number(name, fallback, { min = 0, max = Infinity } = {}) {
+  const n = Number(process.env[name]);
+  if (process.env[name] === undefined || process.env[name].trim() === "" || !Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(n, max));
+}
+
+function list(name) {
+  return (process.env[name] || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** Parses "100" → 100 and "80-95" → [80, 95]; anything else → 100. */
+function parseCompletion(raw) {
+  const match = /^\s*(\d+(?:\.\d+)?)\s*(?:-\s*(\d+(?:\.\d+)?))?\s*$/.exec(raw || "");
+  if (!match) return 100;
+  const a = Math.min(100, Math.max(1, Number(match[1])));
+  if (match[2] === undefined) return a;
+  const b = Math.min(100, Math.max(1, Number(match[2])));
+  return [Math.min(a, b), Math.max(a, b)];
+}
+
+function loadAchievementConfig() {
+  const order = (process.env.ACH_ORDER || "rarity").trim().toLowerCase();
+  if (!["rarity", "random"].includes(order)) {
+    throw new Error(`Unknown ACH_ORDER "${order}". Valid values: rarity, random`);
+  }
+
+  const minHours = number("ACH_MIN_HOURS", 10, { min: 0 });
+  const maxHours = number("ACH_MAX_HOURS", 150, { min: 0 });
+  if (maxHours < minHours) {
+    throw new Error(`ACH_MAX_HOURS (${maxHours}) is lower than ACH_MIN_HOURS (${minHours}).`);
+  }
+
+  return {
+    enabled: flag("ACH_ENABLED", false),
+    dryRun: flag("ACH_DRY_RUN", true),
+    hoursEach: number("ACH_HOURS_EACH", 3, { min: 0.1 }),
+    minHours,
+    maxHours,
+    jitterPercent: number("ACH_JITTER", 20, { max: 90 }),
+    order,
+    completion: parseCompletion(process.env.ACH_COMPLETION),
+    burstChance: number("ACH_BURST", 0.1, { max: 1 }),
+    // Stat-linked achievements are unlocked with their stat raised to match
+    includeProgress: flag("ACH_STAT_LINKED", true),
+    quietHours: process.env.ACH_QUIET_HOURS ?? "02-08",
+    warmupMinutes: number("ACH_WARMUP", 15),
+    exclude: list("ACH_EXCLUDE"),
+    skipGames: list("ACH_SKIP_GAMES").map(Number).filter((id) => id > 0),
+    stateFile: process.env.ACH_STATE_FILE || "./data/achievement-state.json",
   };
 }
